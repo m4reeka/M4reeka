@@ -267,6 +267,12 @@ def build_fmt(shapekey_ids: List[int], weights_per_vertex: int) -> str:
     offset = 0
     element_index = 0
     for (name, semantic_index, fmt, _), size in zip(BASE_SEMANTICS, semantic_sizes):
+        if name == "BLENDINDICES" and weights_per_vertex == 4:
+            fmt = "R8G8B8A8_UINT"
+            size = 4
+        if name == "BLENDWEIGHT" and weights_per_vertex == 4:
+            fmt = "R8G8B8A8_UNORM"
+            size = 4
         lines.extend([
             f"element[{element_index}]:",
             f"  SemanticName: {name}",
@@ -451,6 +457,7 @@ def scan_blend_indices(
     blend_stride: int,
 ) -> Dict[str, int]:
     max_local = 0
+    min_local = 255
     total_weights = 0
     for vertex_id in vertex_ids:
         blend_base = vertex_id * blend_stride
@@ -463,7 +470,10 @@ def scan_blend_indices(
             total_weights += 1
             local_id = blend_buffer[blend_base + slot]
             max_local = max(max_local, local_id)
-    return {"max_local": max_local, "total_weights": total_weights}
+            min_local = min(min_local, local_id)
+    if total_weights == 0:
+        min_local = 0
+    return {"max_local": max_local, "min_local": min_local, "total_weights": total_weights}
 
 
 def write_component_files(
@@ -679,24 +689,34 @@ def main() -> int:
 
                 scan = scan_blend_indices(blend_view, vertex_ids, weights_per_vertex, blend_stride)
                 max_local = scan["max_local"]
+                use_global_blend_indices = bool(component.vg_count and max_local >= component.vg_count)
 
-                if blend_remap_view is not None:
-                    vg_map = build_vg_map(blend_view, blend_remap_view, vertex_ids, weights_per_vertex, blend_stride)
+                if use_global_blend_indices:
+                    vg_map = {local_id: local_id for local_id in range(max_local + 1)}
+                    if component.vg_count:
+                        print(
+                            f"[INFO] Component {component_id}: blend indices appear global "
+                            f"(max {max_local} >= vg_count {component.vg_count}); using identity vg_map."
+                        )
                 else:
-                    vg_map = {}
+                    if blend_remap_view is not None:
+                        vg_map = build_vg_map(blend_view, blend_remap_view, vertex_ids, weights_per_vertex, blend_stride)
+                    else:
+                        vg_map = {}
 
                 if component.vg_count:
                     component_vg_count = component.vg_count
-                    remap_length = max(component_vg_count, max_local + 1)
-                    full_map = {}
-                    for local_id in range(remap_length):
-                        full_map[local_id] = vg_map.get(local_id, component.vg_offset + local_id)
-                    vg_map = full_map
-                    if max_local >= component_vg_count:
-                        print(
-                            f"[WARN] Component {component_id}: blend index {max_local} exceeds vg_count "
-                            f"{component_vg_count} for {ini_path}. Extending vg_map to {remap_length}."
-                        )
+                    if not use_global_blend_indices:
+                        remap_length = max(component_vg_count, max_local + 1)
+                        full_map = {}
+                        for local_id in range(remap_length):
+                            full_map[local_id] = vg_map.get(local_id, component.vg_offset + local_id)
+                        vg_map = full_map
+                        if max_local >= component_vg_count:
+                            print(
+                                f"[WARN] Component {component_id}: blend index {max_local} exceeds vg_count "
+                                f"{component_vg_count} for {ini_path}. Extending vg_map to {remap_length}."
+                            )
                 else:
                     component_vg_count = max_local + 1
                     full_map = {}
